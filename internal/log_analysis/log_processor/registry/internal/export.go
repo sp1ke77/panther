@@ -1,4 +1,4 @@
-package sources
+package internal
 
 /**
  * Panther is a Cloud-Native SIEM for the Modern Security Team.
@@ -19,27 +19,20 @@ package sources
  */
 
 import (
-	"testing"
+	"path"
+	"strings"
 
-	"github.com/stretchr/testify/require"
-
-	"github.com/panther-labs/panther/api/lambda/source/models"
-	"github.com/panther-labs/panther/internal/log_analysis/log_processor/registry"
+	"github.com/iancoleman/strcase"
 )
 
-func Test_BuildClassifier_NoLogTypes(t *testing.T) {
-	var logTypes []string
-	src := &models.SourceIntegration{
-		SourceIntegrationMetadata: models.SourceIntegrationMetadata{
-			IntegrationID:    "integration-id",
-			IntegrationLabel: "integration-label",
-		},
+func splitName(name string) (string, string) {
+	if pos := strings.IndexByte(name, '.'); 0 <= pos && pos < len(name) {
+		return name[:pos], name[pos+1:]
 	}
-	c, err := BuildClassifier(logTypes, src, registry.NativeParsersResolver())
-	require.NoError(t, err)
+	return "", name
+}
 
-	_, err = c.Classify(`{"key":"value}"`)
-
-	require.Error(t, err)
-	require.Equal(t, "failed to classify log line", err.Error())
+func OutputFileName(name string) string {
+	group, name := splitName(name)
+	return path.Join(strcase.ToSnake(group), strcase.ToSnake(name)+".yml")
 }
