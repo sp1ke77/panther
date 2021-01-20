@@ -21,6 +21,12 @@ package api
 import (
 	"context"
 	"fmt"
+	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
+	"github.com/aws/aws-sdk-go/aws/endpoints"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/sns"
+	"github.com/panther-labs/panther/pkg/awsutils"
 	"strings"
 	"time"
 
@@ -67,16 +73,18 @@ func (api *API) PutIntegration(input *models.PutIntegrationInput) (newIntegratio
 		return nil, putIntegrationInternalError
 	}
 
-	// Try to setupExternalResources
-	if err := api.setupExternalResources(newIntegration); err != nil {
-		zap.L().Error("failed to setup external integration", zap.Error(err))
-		return nil, putIntegrationInternalError
-	}
-
 	// Write to DynamoDB
 	item := integrationToItem(newIntegration)
 	if err = api.DdbClient.PutItem(item); err != nil {
 		zap.L().Error("failed to store source integration in DDB", zap.Error(err))
+		return nil, putIntegrationInternalError
+	}
+
+	// Try to setupExternalResources. Do this after saving the integration to the db.
+	// This way, if setting up any external resources fails, we can clean up partially created
+	// resources when the user deletes the integration from the UI.
+	if err := api.setupExternalResources(newIntegration); err != nil {
+		zap.L().Error("failed to setup external resources", zap.Error(err))
 		return nil, putIntegrationInternalError
 	}
 
@@ -97,6 +105,32 @@ func (api *API) setupExternalResources(integration *models.SourceIntegration) er
 		if err := api.AllowExternalSnsTopicSubscription(integration.AWSAccountID); err != nil {
 			return errors.Wrap(err, "failed to add permissions to log processor queue")
 		}
+		if integration.ManagedBucketNotifications {
+			// TODO(giorgosp): If managed notifs fail, don't fail the request? FE will prompt user
+			// to create them automatically.
+			// TODO(giorgosp):-if someone deletes an integration and there is no other integration
+			//  using that bucket, we should delete that SNS topic/notification. ?
+
+			// TODO(giorgosp): if ManagedBucketNotifications, healthcheck should check for this topic.
+
+			sess := session.Must(session.NewSession(&aws.Config{
+				CredentialsChainVerboseErrors: aws.Bool(true),
+			}))
+			stsSess, err := session.NewSession(&aws.Config{
+				CredentialsChainVerboseErrors: aws.Bool(true),
+				Region:                        aws.String(endpoints.UsEast1RegionID), // Bucket region
+				MaxRetries:                    aws.Int(3),
+				Credentials:                   stscreds.NewCredentials(sess, integration.LogProcessingRole),
+			})
+			if err != nil {
+				return errors.Wrap(err, "failed to setup bucket notifications")
+			}
+
+			err = configureNotifications(stsSess, integration)
+			if err != nil {
+				return errors.Wrap(err, "failed to setup bucket notifications")
+			}
+		}
 	case models.IntegrationTypeSqs:
 		if err := api.AllowInputDataBucketSubscription(); err != nil {
 			return errors.Wrap(err, "failed to enable subscription for input bucket")
@@ -112,8 +146,115 @@ func (api *API) setupExternalResources(integration *models.SourceIntegration) er
 	return nil
 }
 
+func configureNotifications(sess *session.Session, integration *models.SourceIntegration) error {
+	snsClient := sns.New(sess)
+	s3Client := s3.New(sess)
+
+	//TODO(giorgosp) If Get/Put notifications fail, don't delete the previously created resources.
+	// User can manually set them up.
+	// If Topic/TopicPolicy/Subscription fails, delete the previous resources so that user can
+	// install the panther-log-processing-notifications.yml stack manually.
+
+	// Create the topic.
+	topic, err := snsClient.CreateTopic(&sns.CreateTopicInput{
+		Name: aws.String("panther-notifications-topic"),
+	})
+	if err != nil {
+		return errors.Wrap(err, "failed to create topic")
+	}
+
+	// Set the topic policy, as defined in deployments/auxiliary/cloudformation/panther-log-processing-notifications.yml.
+	topicPolicy := awsutils.PolicyDocument{
+		Version: "2012-10-17",
+		Statement: []awsutils.StatementEntry{
+			{
+				Sid: "AllowS3EventNotifications",
+				Effect:   "Allow",
+				Action:   "sns:Publish",
+				Resource: *topic.TopicArn,
+				Principal: awsutils.Principal{
+					Service: "s3.amazonaws.com",
+				},
+			}, {
+				Sid: "AllowCloudTrailNotification",
+				Effect:   "Allow",
+				Action:   "sns:Publish",
+				Resource: *topic.TopicArn,
+				Principal: awsutils.Principal{
+					Service: "cloudtrail.amazonaws.com",
+				},
+			},
+		},
+	}
+	topicPolicyJSON, err := jsoniter.MarshalToString(topicPolicy)
+	if err != nil {
+		return errors.Wrap(err, "failed to marshal topic policy")
+	}
+	//TODO(giorgosp): Add retries for eventual consistency issues from CreateTopic()
+	_, err = snsClient.SetTopicAttributes(&sns.SetTopicAttributesInput{
+		TopicArn:       topic.TopicArn,
+		AttributeName:  aws.String("Policy"),
+		AttributeValue: aws.String(topicPolicyJSON),
+	})
+	if err != nil {
+		return errors.Wrap(err, "failed to set topic policy")
+	}
+
+	// Subscribe topic to Panther input data queue
+	sub := sns.SubscribeInput{
+		// TODO(giorgosp): Replace partition, region and account id with Panther's installation values.
+		Endpoint: aws.String("arn:<panther-partition>:sqs:<panther-region>:<panther-acccount-id>:panther-input-data-notifications-queue"),
+		Protocol: aws.String("sqs"),
+		TopicArn: topic.TopicArn,
+	}
+	_, err = snsClient.Subscribe(&sub)
+	if err != nil {
+		return errors.Wrapf(err, "failed to subscribe topic to %s", sub.Endpoint)
+	}
+
+	// Setup bucket notifications
+	getInput := s3.GetBucketNotificationConfigurationRequest{
+		Bucket:              &integration.S3Bucket,
+		ExpectedBucketOwner: &integration.AWSAccountID,
+	}
+	config, err := s3Client.GetBucketNotificationConfiguration(&getInput)
+	if err != nil {
+		return errors.Wrap(err, "failed to get bucket notifications")
+	}
+
+	for _, prefix := range integration.S3PrefixLogTypes.S3Prefixes() {
+		tc := s3.TopicConfiguration{
+			Id: aws.String("panther-managed-" + uuid.New().String()),
+			Events: []*string{aws.String("s3:ObjectCreated:*")},
+			Filter: &s3.NotificationConfigurationFilter{
+				Key: &s3.KeyFilter{
+					FilterRules: []*s3.FilterRule{{
+						Name:  aws.String("prefix"),
+						Value: aws.String(prefix),
+					}},
+				},
+			},
+			TopicArn: topic.TopicArn,
+		}
+		config.TopicConfigurations = append(config.TopicConfigurations, &tc)
+	}
+
+	putInput := s3.PutBucketNotificationConfigurationInput{
+		Bucket:                    &integration.S3Bucket,
+		ExpectedBucketOwner:       &integration.AWSAccountID,
+		NotificationConfiguration: config,
+	}
+	_, err = s3Client.PutBucketNotificationConfiguration(&putInput)
+	if err != nil {
+		return errors.Wrap(err, "failed to put bucket notifications")
+	}
+
+	return nil
+}
+
 func (api *API) validateIntegration(input *models.PutIntegrationInput) error {
 	// Prefixes in the same S3 source should should be unique (although we allow overlapping for now)
+	// todo(giorgosp): Don't allow overlapping prefixes - only for new sources.
 	if input.IntegrationType == models.IntegrationTypeAWS3 {
 		prefixes := input.S3PrefixLogTypes.S3Prefixes()
 		if len(prefixes) != len(stringset.Dedup(prefixes)) {

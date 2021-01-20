@@ -72,6 +72,10 @@ type SourceIntegrationMetadata struct {
 	S3PrefixLogTypes  S3PrefixLogtypes `json:"s3PrefixLogTypes,omitempty"`
 	KmsKey            string           `json:"kmsKey,omitempty"`
 	LogProcessingRole string           `json:"logProcessingRole,omitempty"`
+	// Whether Panther should configure the user's bucket notifications so that
+	// notifications for new files are sent to Panther's topic. Panther should also
+	// create the topic and subscribe it to panther-input-data-notifications-queue.
+	ManagedBucketNotifications bool `json:"managedBucketNotifications,omitempty"`
 
 	StackName string `json:"stackName,omitempty"`
 
